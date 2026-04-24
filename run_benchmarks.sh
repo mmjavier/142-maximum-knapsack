@@ -1,168 +1,227 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_benchmarks.sh  —  Full Knapsack Benchmark Pipeline
+# run_benchmark.sh — Knapsack Algorithm Benchmark Runner
 # =============================================================================
+# Compiles all 5 knapsack C implementations, generates datasets (if needed),
+# then runs each algorithm on every dataset file 5 times, recording the
+# elapsed time (ms) from each run's TIME_MS output line.
 #
-# Steps:
-#   1. Compile knapsack_harness.c with -O3
-#   2. Optionally generate datasets (if --generate flag is passed)
-#   3. Loop over all .txt files in DATASET_DIR
-#   4. Run each file RUNS_PER_FILE times, appending CSV rows to RESULTS_FILE
-#   5. Automatically skip Brute Force when n > BRUTE_FORCE_N_LIMIT
+# Output: results.csv
+#   Columns: Algorithm,N,W,MaxValue,Run1,Run2,Run3,Run4,Run5,Ave
 #
-# Usage:
-#   ./run_benchmarks.sh                    # benchmark only (datasets must exist)
-#   ./run_benchmarks.sh --generate         # generate datasets then benchmark
-#   ./run_benchmarks.sh --generate --seed 7 --outdir my_datasets
-#
-# Options:
-#   --generate             Run generate_data.py before benchmarking
-#   --seed N               RNG seed passed to generate_data.py (default: 42)
-#   --outdir DIR           Dataset directory (default: ./datasets)
-#   --runs N               Runs per file for timing averaging (default: 5)
-#   --results FILE         Output CSV path (default: ./results.csv)
-#   --brute-limit N        Skip BruteForce when n > N (default: 30)
-#   --harness FILE         Path to harness source (default: ./knapsack_harness.c)
+# Safeguards:
+#   - Brute Force is skipped automatically when n > 30
+#   - 2D DP is skipped when the table would exceed MEM_LIMIT_MB (default 512)
+#   - Each run has a TIMEOUT_SEC (default 60 s) hard limit
 # =============================================================================
 
 set -euo pipefail
 
-# ─── Defaults ────────────────────────────────────────────────────────────────
-GENERATE=0
-SEED=42
-DATASET_DIR="datasets"
-RUNS_PER_FILE=5
-RESULTS_FILE="results.csv"
-BRUTE_FORCE_N_LIMIT=30
-TIMEOUT_SECS=120   # wall-clock seconds before killing a single harness run
-HARNESS_SRC="knapsack_harness.c"
-HARNESS_BIN="knapsack_harness"
-PYTHON="python3"
+# ── Tunables ──────────────────────────────────────────────────────────────────
+DATASET_DIR="${DATASET_DIR:-./datasets}"
+RESULTS_CSV="${RESULTS_CSV:-results.csv}"
+RUNS=5
+TIMEOUT_SEC=60          # wall-clock seconds before a run is killed
+MEM_LIMIT_MB=512        # skip 2D DP if table > this many MB
+BF_N_LIMIT=30           # skip Brute Force when n exceeds this
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─── Argument parsing ────────────────────────────────────────────────────────
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --generate)        GENERATE=1 ;;
-        --seed)            SEED="$2";        shift ;;
-        --outdir)          DATASET_DIR="$2"; shift ;;
-        --runs)            RUNS_PER_FILE="$2"; shift ;;
-        --results)         RESULTS_FILE="$2"; shift ;;
-        --brute-limit)     BRUTE_FORCE_N_LIMIT="$2"; shift ;;
-        --timeout)         TIMEOUT_SECS="$2";           shift ;;
-        --harness)         HARNESS_SRC="$2"; shift ;;
-        -h|--help)
-            sed -n '2,40p' "$0"   # print the header comment
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $1  (use --help for usage)" >&2
-            exit 1
-            ;;
-    esac
-    shift
+# ── Colours (disabled if not a terminal) ─────────────────────────────────────
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'; YEL='\033[0;33m'; GRN='\033[0;32m'
+    CYN='\033[0;36m'; BOLD='\033[1m'; RST='\033[0m'
+else
+    RED=''; YEL=''; GRN=''; CYN=''; BOLD=''; RST=''
+fi
+
+log()  { echo -e "${BOLD}[BENCH]${RST} $*"; }
+warn() { echo -e "${YEL}[WARN]${RST}  $*"; }
+err()  { echo -e "${RED}[ERR]${RST}   $*" >&2; }
+ok()   { echo -e "${GRN}[OK]${RST}    $*"; }
+
+# ── Dependency checks ─────────────────────────────────────────────────────────
+for cmd in gcc python3 bc; do
+    command -v "$cmd" &>/dev/null || { err "Required command not found: $cmd"; exit 1; }
 done
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ── Step 1 — Compile ──────────────────────────────────────────────────────────
+log "Compiling C sources with gcc -O3 ..."
 
-info()  { echo "[INFO]  $*"; }
-warn()  { echo "[WARN]  $*" >&2; }
-error() { echo "[ERROR] $*" >&2; exit 1; }
+declare -A BIN_MAP=(
+    [BruteForce]="01_brute_force.c"
+    [DP_2D]="02_dp_2d.c"
+    [DP_1D]="03_dp_1d.c"
+    [Greedy]="04_greedy.c"
+    [BranchBound]="05_branch_bound.c"
+)
 
-# Extract n and W from the first line of a dataset file.
-# Returns two space-separated integers.
-read_n_W() {
-    head -n 1 "$1"
-}
+declare -A BIN_PATH
 
-# ─── Step 0: Generate datasets (optional) ────────────────────────────────────
-if [[ $GENERATE -eq 1 ]]; then
-    info "Generating datasets (seed=$SEED, outdir=$DATASET_DIR) ..."
-    "$PYTHON" generate_data.py --seed "$SEED" --outdir "$DATASET_DIR" \
-        || error "generate_data.py failed. Aborting."
-    info "Dataset generation complete."
+for algo in "${!BIN_MAP[@]}"; do
+    src="${BIN_MAP[$algo]}"
+    bin="./bin_${algo}"
+    if gcc -O3 -o "$bin" "$src" -lm 2>/dev/null; then
+        ok "  $algo  ← $src"
+        BIN_PATH[$algo]="$bin"
+    else
+        err "  Failed to compile $src — $algo will be skipped."
+    fi
+done
+
+# ── Step 2 — Generate datasets (if directory is absent or empty) ──────────────
+if [[ ! -d "$DATASET_DIR" ]] || [[ -z "$(find "$DATASET_DIR" -name '*.txt' 2>/dev/null)" ]]; then
+    log "Dataset directory '$DATASET_DIR' is empty or missing — running generate_data.py ..."
+    python3 generate_data.py --outdir "$DATASET_DIR"
+else
+    log "Using existing datasets in '$DATASET_DIR'."
 fi
 
-# ─── Step 1: Verify datasets exist ───────────────────────────────────────────
-if [[ ! -d "$DATASET_DIR" ]]; then
-    error "Dataset directory '$DATASET_DIR' not found. Run with --generate first."
-fi
-
-mapfile -t ALL_FILES < <(find "$DATASET_DIR" -name "*.txt" | sort)
+# ── Step 3 — Collect all .txt dataset files ───────────────────────────────────
+mapfile -t ALL_FILES < <(find "$DATASET_DIR" -name '*.txt' | sort)
 
 if [[ ${#ALL_FILES[@]} -eq 0 ]]; then
-    error "No .txt files found under '$DATASET_DIR'. Run with --generate first."
+    err "No .txt files found under '$DATASET_DIR'. Aborting."
+    exit 1
 fi
+log "Found ${#ALL_FILES[@]} dataset file(s)."
 
-info "Found ${#ALL_FILES[@]} dataset file(s) in '$DATASET_DIR'."
-
-# ─── Step 2: Compile ─────────────────────────────────────────────────────────
-if [[ ! -f "$HARNESS_SRC" ]]; then
-    error "Harness source '$HARNESS_SRC' not found."
-fi
-
-info "Compiling $HARNESS_SRC with -O3 ..."
-gcc -O3 -Wall -Wextra -o "$HARNESS_BIN" "$HARNESS_SRC" -lm \
-    || error "Compilation failed. Aborting."
-info "Compiled → ./$HARNESS_BIN"
-
-# ─── Step 3: Initialise results CSV ──────────────────────────────────────────
-CSV_HEADER="Algorithm,N,W,MaxValue,Time_Seconds"
-
-if [[ ! -f "$RESULTS_FILE" ]]; then
-    echo "$CSV_HEADER" > "$RESULTS_FILE"
-    info "Created $RESULTS_FILE with header."
+# ── Step 4 — Initialise CSV ───────────────────────────────────────────────────
+if [[ ! -f "$RESULTS_CSV" ]]; then
+    echo "Algorithm,N,W,MaxValue,Run1,Run2,Run3,Run4,Run5,Ave" > "$RESULTS_CSV"
+    log "Created $RESULTS_CSV with header."
 else
-    # Verify header matches to avoid silent corruption
-    EXISTING_HEADER=$(head -n 1 "$RESULTS_FILE")
-    if [[ "$EXISTING_HEADER" != "$CSV_HEADER" ]]; then
-        warn "Existing $RESULTS_FILE has unexpected header; appending anyway."
-    else
-        info "Appending to existing $RESULTS_FILE."
-    fi
+    log "Appending to existing $RESULTS_CSV."
 fi
 
-# ─── Step 4: Benchmark loop ───────────────────────────────────────────────────
-TOTAL=${#ALL_FILES[@]}
-FILE_IDX=0
-SKIPPED_BRUTE=0
+# ── Helper: extract a value from program output ───────────────────────────────
+extract_max_value() {
+    # Looks for lines like:  Max Value   : 1234  /  Max Value    : 1234
+    grep -oP '(?<=Max Value\s{1,6}:\s)\d+' <<< "$1" | head -1
+}
 
-for DATASET in "${ALL_FILES[@]}"; do
-    FILE_IDX=$(( FILE_IDX + 1 ))
-    BASENAME=$(basename "$DATASET")
+extract_time_ms() {
+    grep -oP '(?<=TIME_MS:)[\d.]+' <<< "$1" | head -1
+}
 
-    # Read n and W from the file header
-    read -r FILE_N FILE_W < <(read_n_W "$DATASET")
+# ── Helper: read n and W from a dataset file ──────────────────────────────────
+read_n_w() {
+    local file="$1"
+    local W n
+    # Format: Line 1 = W,  Line 2 = n  (space-separated on same or separate lines)
+    read -r W  < <(sed -n '1p' "$file")
+    read -r n  < <(sed -n '2p' "$file")
+    echo "$n $W"
+}
 
-    # Decide whether to skip Brute Force
-    SKIP_FLAG=""
-    if [[ "$FILE_N" -gt "$BRUTE_FORCE_N_LIMIT" ]]; then
-        SKIP_FLAG="--skip-brute"
-        SKIPPED_BRUTE=$(( SKIPPED_BRUTE + 1 ))
-        BRUTE_NOTE="[BruteForce SKIPPED: n=$FILE_N > $BRUTE_FORCE_N_LIMIT]"
-    else
-        BRUTE_NOTE=""
-    fi
+# ── Step 5 — Main benchmark loop ──────────────────────────────────────────────
+total_files=${#ALL_FILES[@]}
+file_idx=0
 
-    info "[$FILE_IDX/$TOTAL] $BASENAME  (n=$FILE_N, W=$FILE_W)  runs=$RUNS_PER_FILE  $BRUTE_NOTE"
+for dataset in "${ALL_FILES[@]}"; do
+    (( file_idx++ )) || true
+    fname=$(basename "$dataset")
+    read -r n W <<< "$(read_n_w "$dataset")"
 
-    # Run RUNS_PER_FILE times, appending each run's rows directly to the CSV
-    for RUN in $(seq 1 "$RUNS_PER_FILE"); do
-        # The harness prints 5 CSV rows (one per algorithm) to stdout.
-        # We append directly, no temp file needed.
-        timeout "$TIMEOUT_SECS" ./"$HARNESS_BIN" "$DATASET" $SKIP_FLAG             >> "$RESULTS_FILE"             || warn "  Run $RUN timed-out or failed for $BASENAME (exit $?) — continuing."
+    echo ""
+    log "${CYN}[$file_idx/$total_files]${RST} $fname  (n=$n, W=$W)"
+
+    # ── Determine algo order (BruteForce last so slowdowns don't block others) ─
+    algo_order=(Greedy DP_1D DP_2D BranchBound BruteForce)
+
+    for algo in "${algo_order[@]}"; do
+        bin="${BIN_PATH[$algo]:-}"
+
+        # Skip if binary didn't compile
+        if [[ -z "$bin" ]]; then
+            warn "    [$algo] binary missing — skip."
+            continue
+        fi
+
+        # ── Safeguard: Brute Force n > BF_N_LIMIT ─────────────────────────────
+        if [[ "$algo" == "BruteForce" ]] && (( n > BF_N_LIMIT )); then
+            warn "    [$algo] n=$n > $BF_N_LIMIT — SKIPPED (would run ~2^$n iterations)."
+            echo "$algo,$n,$W,SKIPPED(n>$BF_N_LIMIT),,,,,," >> "$RESULTS_CSV"
+            continue
+        fi
+
+        # ── Safeguard: 2D DP memory wall ──────────────────────────────────────
+        if [[ "$algo" == "DP_2D" ]]; then
+            table_mb=$(( (n + 1) * (W + 1) * 4 / 1024 / 1024 ))
+            if (( table_mb > MEM_LIMIT_MB )); then
+                warn "    [$algo] table ~${table_mb}MB > limit ${MEM_LIMIT_MB}MB — SKIPPED."
+                echo "$algo,$n,$W,SKIPPED(mem>${MEM_LIMIT_MB}MB),,,,,," >> "$RESULTS_CSV"
+                continue
+            fi
+        fi
+
+        echo -n "    [$algo]"
+
+        times=()
+        max_value="N/A"
+        run_failed=0
+
+        for (( run=1; run<=RUNS; run++ )); do
+            output=$(timeout "$TIMEOUT_SEC" "$bin" "$dataset" 2>/dev/null) || {
+                rc=$?
+                if [[ $rc -eq 124 ]]; then
+                    warn " run$run=TIMEOUT(>${TIMEOUT_SEC}s)"
+                else
+                    warn " run$run=ERROR(rc=$rc)"
+                fi
+                times+=("FAIL")
+                run_failed=1
+                continue
+            }
+
+            t=$(extract_time_ms "$output")
+            if [[ -z "$t" ]]; then
+                warn " run$run=NO_TIME"
+                times+=("FAIL")
+                run_failed=1
+                continue
+            fi
+            times+=("$t")
+            echo -n " ${t}ms"
+
+            # Capture MaxValue from first successful run
+            if [[ "$max_value" == "N/A" ]]; then
+                mv=$(extract_max_value "$output")
+                [[ -n "$mv" ]] && max_value="$mv"
+            fi
+        done
+
+        # Compute average (skip FAIL entries)
+        valid_times=()
+        for t in "${times[@]}"; do
+            [[ "$t" != "FAIL" ]] && valid_times+=("$t")
+        done
+
+        if (( ${#valid_times[@]} > 0 )); then
+            sum_expr=$(IFS=+; echo "${valid_times[*]}")
+            ave=$(echo "scale=4; ($sum_expr) / ${#valid_times[@]}" | bc)
+        else
+            ave="N/A"
+        fi
+
+        echo "  → Ave=${ave}ms  MaxValue=${max_value}"
+
+        # Pad times array to exactly RUNS entries
+        while (( ${#times[@]} < RUNS )); do
+            times+=("N/A")
+        done
+
+        # Write CSV row
+        printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+            "$algo" "$n" "$W" "$max_value" \
+            "${times[0]}" "${times[1]}" "${times[2]}" "${times[3]}" "${times[4]}" \
+            "$ave" >> "$RESULTS_CSV"
     done
-
 done
 
-# ─── Step 5: Summary ─────────────────────────────────────────────────────────
-TOTAL_ROWS=$(( $(wc -l < "$RESULTS_FILE") - 1 ))  # subtract header
-
 echo ""
-echo "════════════════════════════════════════════════════════"
-echo "  Benchmark complete."
-echo "  Datasets run    : $TOTAL"
-echo "  Runs per file   : $RUNS_PER_FILE"
-echo "  CSV rows written: $TOTAL_ROWS"
-echo "  BruteForce skips: $SKIPPED_BRUTE file(s) had n > $BRUTE_FORCE_N_LIMIT"
-echo "  Results saved to: $RESULTS_FILE"
-echo "════════════════════════════════════════════════════════"
+ok "Benchmark complete. Results saved to: ${BOLD}$RESULTS_CSV${RST}"
+echo ""
+echo "Quick summary (first 20 rows):"
+echo "────────────────────────────────────────────────────────────────"
+column -t -s',' "$RESULTS_CSV" 2>/dev/null | head -21 || head -21 "$RESULTS_CSV"
+echo "────────────────────────────────────────────────────────────────"
