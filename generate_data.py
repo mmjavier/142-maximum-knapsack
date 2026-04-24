@@ -37,7 +37,8 @@ def write_dataset(path: str, n: int, W: int, items: list[tuple[int, int]]) -> No
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
-        f.write(f"{n} {W}\n")
+        f.write(f"{W}\n")
+        f.write(f"{n}\n")
         for w, v in items:
             f.write(f"{w} {v}\n")
     print(f"  Written: {path}  (n={n}, W={W})")
