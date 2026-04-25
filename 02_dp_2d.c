@@ -174,8 +174,8 @@ int main(int argc, char *argv[]) {
     computeDP(dp, items, n, W);
  
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    double elapsed_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000.0
-                      + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e6;
+    double elapsed_sec = (ts_end.tv_sec - ts_start.tv_sec)
+                       + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
  
     printf("=== 2D DP Result ===\n");
     printf("Max Value   : %d\n", dp[n][W]);
@@ -186,7 +186,14 @@ int main(int argc, char *argv[]) {
     }
  
     backtrack(dp, items, n, W);
-    printf("TIME_MS:%.4f\n", elapsed_ms);
+
+    /* Analytical peak memory:
+     * 2D matrix of (n+1)*(W+1) integers.
+     * Cast to double BEFORE multiplication to prevent 32-bit overflow. */
+    double mem_mb = (((double)(n + 1) * (double)(W + 1)) * sizeof(int)) / 1048576.0;
+
+    printf("TIME_SEC:%.6f\n", elapsed_sec);
+    printf("MEMORY_MB:%.6f\n", mem_mb);
  
     freeTable(dp, n);
     free(items);

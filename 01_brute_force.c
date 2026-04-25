@@ -47,7 +47,7 @@ void printSubset(Item *items, int n, unsigned long long mask) {
 /*  Brute-force solver                                                  */
 /* ------------------------------------------------------------------ */
  
-void bruteForce(Item *items, int n, int W) {
+int bruteForce(Item *items, int n, int W) {
     int         bestValue  = 0;
     int         bestWeight = 0;
     unsigned long long bestMask  = 0;
@@ -77,6 +77,7 @@ void bruteForce(Item *items, int n, int W) {
     printf("Total Weight: %d / %d\n", bestWeight, W);
     printSubset(items, n, bestMask);
     printf("Subsets checked: %llu\n", total);
+    return bestValue;
 }
  
 /* ------------------------------------------------------------------ */
@@ -123,9 +124,16 @@ int main(int argc, char *argv[]) {
     bruteForce(items, n, W);
  
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    double elapsed_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000.0
-                      + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e6;
-    printf("TIME_MS:%.4f\n", elapsed_ms);
+    double elapsed_sec = (ts_end.tv_sec - ts_start.tv_sec)
+                       + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
+
+    /* Analytical peak memory:
+     * Item array (n * sizeof(Item)) + recursion stack (n frames * 32 bytes)
+     * Cast to double BEFORE multiplication to prevent 32-bit overflow. */
+    double mem_mb = ((double)n * sizeof(Item) + (double)n * 32.0) / 1048576.0;
+
+    printf("TIME_SEC:%.6f\n", elapsed_sec);
+    printf("MEMORY_MB:%.6f\n", mem_mb);
  
     free(items);
     return EXIT_SUCCESS;

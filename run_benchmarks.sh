@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_benchmark.sh — Knapsack Algorithm Benchmark Runner
+# run_benchmarks.sh — Knapsack Algorithm Benchmark Runner (macOS-compatible)
 # =============================================================================
 # Compiles all 5 knapsack C implementations, generates datasets (if needed),
-# then runs each algorithm on every dataset file 5 times, recording the
-# elapsed time (ms) from each run's TIME_MS output line.
+# then runs each algorithm on every dataset file, recording elapsed time
+# (seconds) and analytical peak memory (MB) from each run's output.
 #
 # Output: results.csv
-#   Columns: Algorithm,N,W,MaxValue,Run1,Run2,Run3,Run4,Run5,Ave
+#   Columns: Algorithm,N,W,MaxValue,Time_Seconds,Memory_MB
 #
 # Safeguards:
-#   - Brute Force is skipped automatically when n > 30
+#   - Brute Force is skipped automatically when n > BF_N_LIMIT (default 30)
 #   - 2D DP is skipped when the table would exceed MEM_LIMIT_MB (default 512)
-#   - Each run has a TIMEOUT_SEC (default 60 s) hard limit
+#   - Each run has a TIMEOUT_SEC (default 120 s) hard limit
+#   - macOS-safe timeout via background process + kill
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 DATASET_DIR="${DATASET_DIR:-./datasets}"
 RESULTS_CSV="${RESULTS_CSV:-results.csv}"
 RUNS=5
-TIMEOUT_SEC=60          # wall-clock seconds before a run is killed
+TIMEOUT_SEC=10800       # wall-clock seconds before a run is killed (3 hours)
 MEM_LIMIT_MB=512        # skip 2D DP if table > this many MB
-BF_N_LIMIT=30           # skip Brute Force when n exceeds this
+BF_N_LIMIT=35           # skip Brute Force when n exceeds this
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Colours (disabled if not a terminal) ─────────────────────────────────────
@@ -39,37 +40,90 @@ warn() { echo -e "${YEL}[WARN]${RST}  $*"; }
 err()  { echo -e "${RED}[ERR]${RST}   $*" >&2; }
 ok()   { echo -e "${GRN}[OK]${RST}    $*"; }
 
+# ── macOS-safe timeout helper ─────────────────────────────────────────────────
+# Runs "$@" with a wall-clock timeout. Exits with the command's exit code, or
+# 124 if the timeout fires. Works on macOS without coreutils.
+run_with_timeout() {
+    local secs="$1"; shift
+    # If gtimeout (coreutils) is available, prefer it
+    if command -v gtimeout &>/dev/null; then
+        gtimeout "$secs" "$@"
+        return $?
+    fi
+    # If GNU timeout is available (Linux or homebrew timeout)
+    if command -v timeout &>/dev/null; then
+        timeout "$secs" "$@"
+        return $?
+    fi
+    # Pure-bash fallback: run in background, wait, kill if needed
+    "$@" &
+    local pid=$!
+    (
+        sleep "$secs"
+        kill -TERM "$pid" 2>/dev/null
+        sleep 1
+        kill -KILL "$pid" 2>/dev/null
+    ) &
+    local watcher_pid=$!
+    wait "$pid" 2>/dev/null
+    local rc=$?
+    # Kill the watcher if the process finished before timeout
+    kill "$watcher_pid" 2>/dev/null
+    wait "$watcher_pid" 2>/dev/null
+    if [[ $rc -eq 0 || $rc -lt 128 ]]; then
+        return $rc
+    fi
+    # SIGTERM gives rc=143, SIGKILL gives rc=137 on macOS
+    return 124
+}
+
 # ── Dependency checks ─────────────────────────────────────────────────────────
-for cmd in gcc python3 bc; do
+for cmd in gcc python3; do
     command -v "$cmd" &>/dev/null || { err "Required command not found: $cmd"; exit 1; }
 done
+
+# bc is optional — we use awk for arithmetic if bc is absent
+USE_BC=0
+command -v bc &>/dev/null && USE_BC=1
 
 # ── Step 1 — Compile ──────────────────────────────────────────────────────────
 log "Compiling C sources with gcc -O3 ..."
 
-declare -A BIN_MAP=(
-    [BruteForce]="01_brute_force.c"
-    [DP_2D]="02_dp_2d.c"
-    [DP_1D]="03_dp_1d.c"
-    [Greedy]="04_greedy.c"
-    [BranchBound]="05_branch_bound.c"
+rm -f ./bin_BruteForce ./bin_DP_2D ./bin_DP_1D ./bin_Greedy ./bin_BranchBound
+
+ALGOS=(
+    "BruteForce:01_brute_force.c"
+    "DP_2D:02_dp_2d.c"
+    "DP_1D:03_dp_1d.c"
+    "Greedy:04_greedy.c"
+    "BranchBound:05_branch_bound.c"
 )
 
-declare -A BIN_PATH
-
-for algo in "${!BIN_MAP[@]}"; do
-    src="${BIN_MAP[$algo]}"
+compile_ok=0
+for pair in "${ALGOS[@]}"; do
+    algo="${pair%%:*}"
+    src="${pair##*:}"
     bin="./bin_${algo}"
-    if gcc -O3 -o "$bin" "$src" -lm 2>/dev/null; then
+    if [[ ! -f "$src" ]]; then
+        err "  Source file '$src' not found — $algo will be skipped."
+        continue
+    fi
+    if gcc -O3 -o "$bin" "$src" -lm 2>/tmp/gcc_err_${algo}.txt; then
         ok "  $algo  ← $src"
-        BIN_PATH[$algo]="$bin"
+        (( compile_ok++ )) || true
     else
         err "  Failed to compile $src — $algo will be skipped."
+        cat /tmp/gcc_err_${algo}.txt >&2
     fi
 done
 
+if (( compile_ok == 0 )); then
+    err "No algorithms compiled successfully. Aborting."
+    exit 1
+fi
+
 # ── Step 2 — Generate datasets (if directory is absent or empty) ──────────────
-if [[ ! -d "$DATASET_DIR" ]] || [[ -z "$(find "$DATASET_DIR" -name '*.txt' 2>/dev/null)" ]]; then
+if [[ ! -d "$DATASET_DIR" ]] || [[ -z "$(find "$DATASET_DIR" -name '*.txt' 2>/dev/null | head -1)" ]]; then
     log "Dataset directory '$DATASET_DIR' is empty or missing — running generate_data.py ..."
     python3 generate_data.py --outdir "$DATASET_DIR"
 else
@@ -77,7 +131,10 @@ else
 fi
 
 # ── Step 3 — Collect all .txt dataset files ───────────────────────────────────
-mapfile -t ALL_FILES < <(find "$DATASET_DIR" -name '*.txt' | sort)
+ALL_FILES=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && ALL_FILES+=("$line")
+done < <(find "$DATASET_DIR" -name '*.txt' | sort)
 
 if [[ ${#ALL_FILES[@]} -eq 0 ]]; then
     err "No .txt files found under '$DATASET_DIR'. Aborting."
@@ -86,30 +143,41 @@ fi
 log "Found ${#ALL_FILES[@]} dataset file(s)."
 
 # ── Step 4 — Initialise CSV ───────────────────────────────────────────────────
-if [[ ! -f "$RESULTS_CSV" ]]; then
-    echo "Algorithm,N,W,MaxValue,Run1,Run2,Run3,Run4,Run5,Ave" > "$RESULTS_CSV"
-    log "Created $RESULTS_CSV with header."
-else
-    log "Appending to existing $RESULTS_CSV."
-fi
+echo "Algorithm,N,W,MaxValue,Time_Seconds,Memory_MB" > "$RESULTS_CSV"
+log "Created $RESULTS_CSV with header."
 
 # ── Helper: extract a value from program output ───────────────────────────────
 extract_max_value() {
-    # Looks for lines like:  Max Value   : 1234  /  Max Value    : 1234
-    grep -oP '(?<=Max Value\s{1,6}:\s)\d+' <<< "$1" | head -1
+    # Greedy prints "Max Value    : N"; others print "Max Value  : N" or "Max Value   : N"
+    echo "$1" | awk -F':' '/Max Value/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }'
 }
 
-extract_time_ms() {
-    grep -oP '(?<=TIME_MS:)[\d.]+' <<< "$1" | head -1
+extract_time_sec() {
+    echo "$1" | awk -F'TIME_SEC:' '/TIME_SEC:/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }'
+}
+
+extract_memory_mb() {
+    echo "$1" | awk -F'MEMORY_MB:' '/MEMORY_MB:/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }'
+}
+
+# ── Helper: compute average with awk (no bc dependency) ──────────────────────
+awk_average() {
+    # $@ = list of numeric values
+    local vals=("$@")
+    local n=${#vals[@]}
+    if (( n == 0 )); then echo "N/A"; return; fi
+    local sum_expr
+    printf -v sum_expr '%s+' "${vals[@]}"
+    sum_expr="${sum_expr%+}"  # strip trailing '+'
+    awk "BEGIN { printf \"%.6f\", ($sum_expr) / $n }"
 }
 
 # ── Helper: read n and W from a dataset file ──────────────────────────────────
 read_n_w() {
     local file="$1"
     local W n
-    # Format: Line 1 = W,  Line 2 = n  (space-separated on same or separate lines)
-    read -r W  < <(sed -n '1p' "$file")
-    read -r n  < <(sed -n '2p' "$file")
+    read -r W < <(sed -n '1p' "$file")
+    read -r n < <(sed -n '2p' "$file")
     echo "$n $W"
 }
 
@@ -122,17 +190,23 @@ for dataset in "${ALL_FILES[@]}"; do
     fname=$(basename "$dataset")
     read -r n W <<< "$(read_n_w "$dataset")"
 
+    # Validate parsed values
+    if ! [[ "$n" =~ ^[0-9]+$ ]] || ! [[ "$W" =~ ^[0-9]+$ ]]; then
+        warn "Could not parse n/W from '$fname' — skipping."
+        continue
+    fi
+
     echo ""
     log "${CYN}[$file_idx/$total_files]${RST} $fname  (n=$n, W=$W)"
 
-    # ── Determine algo order (BruteForce last so slowdowns don't block others) ─
+    # Run algorithms: fast ones first, BruteForce last
     algo_order=(Greedy DP_1D DP_2D BranchBound BruteForce)
 
     for algo in "${algo_order[@]}"; do
-        bin="${BIN_PATH[$algo]:-}"
+        bin="./bin_${algo}"
 
         # Skip if binary didn't compile
-        if [[ -z "$bin" ]]; then
+        if [[ ! -x "$bin" ]]; then
             warn "    [$algo] binary missing — skip."
             continue
         fi
@@ -140,88 +214,107 @@ for dataset in "${ALL_FILES[@]}"; do
         # ── Safeguard: Brute Force n > BF_N_LIMIT ─────────────────────────────
         if [[ "$algo" == "BruteForce" ]] && (( n > BF_N_LIMIT )); then
             warn "    [$algo] n=$n > $BF_N_LIMIT — SKIPPED (would run ~2^$n iterations)."
-            echo "$algo,$n,$W,SKIPPED(n>$BF_N_LIMIT),,,,,," >> "$RESULTS_CSV"
+            printf "%s,%s,%s,%s,%s,%s\n" \
+                "$algo" "$n" "$W" "SKIPPED(n>$BF_N_LIMIT)" "N/A" "N/A" >> "$RESULTS_CSV"
             continue
         fi
 
         # ── Safeguard: 2D DP memory wall ──────────────────────────────────────
         if [[ "$algo" == "DP_2D" ]]; then
-            table_mb=$(( (n + 1) * (W + 1) * 4 / 1024 / 1024 ))
+            # Use awk to avoid integer overflow on large n*W products
+            table_mb=$(awk "BEGIN { printf \"%.0f\", (($n + 1.0) * ($W + 1.0) * 4) / 1048576 }")
             if (( table_mb > MEM_LIMIT_MB )); then
                 warn "    [$algo] table ~${table_mb}MB > limit ${MEM_LIMIT_MB}MB — SKIPPED."
-                echo "$algo,$n,$W,SKIPPED(mem>${MEM_LIMIT_MB}MB),,,,,," >> "$RESULTS_CSV"
+                printf "%s,%s,%s,%s,%s,%s\n" \
+                    "$algo" "$n" "$W" "SKIPPED(mem>${MEM_LIMIT_MB}MB)" "N/A" "N/A" >> "$RESULTS_CSV"
                 continue
             fi
         fi
 
         echo -n "    [$algo]"
 
-        times=()
+        all_times=()
+        all_mems=()
         max_value="N/A"
-        run_failed=0
+        any_success=0
 
         for (( run=1; run<=RUNS; run++ )); do
-            output=$(timeout "$TIMEOUT_SEC" "$bin" "$dataset" 2>/dev/null) || {
-                rc=$?
-                if [[ $rc -eq 124 ]]; then
-                    warn " run$run=TIMEOUT(>${TIMEOUT_SEC}s)"
-                else
-                    warn " run$run=ERROR(rc=$rc)"
-                fi
-                times+=("FAIL")
-                run_failed=1
-                continue
-            }
+            output=""
+            run_with_timeout "$TIMEOUT_SEC" "$bin" "$dataset" > /tmp/bench_out_$$.txt 2>/dev/null
+            rc=$?
+            output=$(cat /tmp/bench_out_$$.txt 2>/dev/null || true)
+            rm -f /tmp/bench_out_$$.txt
 
-            t=$(extract_time_ms "$output")
-            if [[ -z "$t" ]]; then
-                warn " run$run=NO_TIME"
-                times+=("FAIL")
-                run_failed=1
+            if [[ $rc -eq 124 ]]; then
+                warn " run$run=TIMEOUT(>${TIMEOUT_SEC}s)"
+                all_times+=("TIMEOUT")
+                all_mems+=("N/A")
+                continue
+            elif [[ $rc -ne 0 ]]; then
+                warn " run$run=ERROR(rc=$rc)"
+                all_times+=("FAIL")
+                all_mems+=("N/A")
                 continue
             fi
-            times+=("$t")
-            echo -n " ${t}ms"
 
-            # Capture MaxValue from first successful run
+            t=$(extract_time_sec "$output")
+            m=$(extract_memory_mb "$output")
+
+            if [[ -z "$t" ]]; then
+                warn " run$run=NO_TIME_SEC"
+                all_times+=("FAIL")
+                all_mems+=("N/A")
+                continue
+            fi
+
+            all_times+=("$t")
+            any_success=1
+            echo -n " ${t}s"
+
+            # Capture MaxValue and Memory from first successful run
             if [[ "$max_value" == "N/A" ]]; then
                 mv=$(extract_max_value "$output")
                 [[ -n "$mv" ]] && max_value="$mv"
             fi
+            if [[ -z "$m" ]]; then m="N/A"; fi
+            all_mems+=("$m")
         done
 
-        # Compute average (skip FAIL entries)
+        # Compute average time across successful runs
         valid_times=()
-        for t in "${times[@]}"; do
-            [[ "$t" != "FAIL" ]] && valid_times+=("$t")
+        for t in "${all_times[@]}"; do
+            [[ "$t" != "FAIL" && "$t" != "TIMEOUT" && "$t" != "N/A" ]] && valid_times+=("$t")
         done
 
         if (( ${#valid_times[@]} > 0 )); then
-            sum_expr=$(IFS=+; echo "${valid_times[*]}")
-            ave=$(echo "scale=4; ($sum_expr) / ${#valid_times[@]}" | bc)
+            ave_time=$(awk_average "${valid_times[@]}")
         else
-            ave="N/A"
+            ave_time="N/A"
         fi
 
-        echo "  → Ave=${ave}ms  MaxValue=${max_value}"
-
-        # Pad times array to exactly RUNS entries
-        while (( ${#times[@]} < RUNS )); do
-            times+=("N/A")
+        # Use memory from first successful run (it's deterministic / analytical)
+        mem_out="N/A"
+        for m in "${all_mems[@]}"; do
+            if [[ "$m" != "N/A" && -n "$m" ]]; then
+                mem_out="$m"
+                break
+            fi
         done
 
-        # Write CSV row
-        printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
-            "$algo" "$n" "$W" "$max_value" \
-            "${times[0]}" "${times[1]}" "${times[2]}" "${times[3]}" "${times[4]}" \
-            "$ave" >> "$RESULTS_CSV"
+        echo "  → Ave=${ave_time}s  MaxValue=${max_value}  Mem=${mem_out}MB"
+
+        # Write CSV row: Algorithm,N,W,MaxValue,Time_Seconds,Memory_MB
+        printf "%s,%s,%s,%s,%s,%s\n" \
+            "$algo" "$n" "$W" "$max_value" "$ave_time" "$mem_out" >> "$RESULTS_CSV"
     done
 done
+
+rm -f /tmp/bench_out_$$.txt 2>/dev/null
 
 echo ""
 ok "Benchmark complete. Results saved to: ${BOLD}$RESULTS_CSV${RST}"
 echo ""
 echo "Quick summary (first 20 rows):"
-echo "────────────────────────────────────────────────────────────────"
+echo "────────────────────────────────────────────────────────────────────────"
 column -t -s',' "$RESULTS_CSV" 2>/dev/null | head -21 || head -21 "$RESULTS_CSV"
-echo "────────────────────────────────────────────────────────────────"
+echo "────────────────────────────────────────────────────────────────────────"

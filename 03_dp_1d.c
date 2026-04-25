@@ -145,9 +145,18 @@ int main(int argc, char *argv[]) {
     solveKnapsack1D(items, n, W);
  
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    double elapsed_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000.0
-                      + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e6;
-    printf("TIME_MS:%.4f\n", elapsed_ms);
+    double elapsed_sec = (ts_end.tv_sec - ts_start.tv_sec)
+                       + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
+
+    /* Analytical peak memory:
+     * Single 1D dp array of (W+1) integers.
+     * (The keep[][] matrix is a backtracking aid, not the algorithm's
+     *  core space — the theoretical 1D-DP space is one array.)
+     * Cast to double BEFORE multiplication to prevent 32-bit overflow. */
+    double mem_mb = ((double)(W + 1) * sizeof(int)) / 1048576.0;
+
+    printf("TIME_SEC:%.6f\n", elapsed_sec);
+    printf("MEMORY_MB:%.6f\n", mem_mb);
  
     free(items);
     return EXIT_SUCCESS;
